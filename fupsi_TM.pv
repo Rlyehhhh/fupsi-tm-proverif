@@ -1,0 +1,160 @@
+(* FuPSI-TM privacy-enhanced variant *)
+
+free c: channel.
+free c_mpc_server: channel [private].
+free c_mpc_client: channel [private].
+free c_mpc_result: channel [private].
+
+type radius.
+type layer.
+type timestamp.
+type cell.
+type block.
+type okvs.
+type payload_okvs.
+type public_param.
+type token.
+
+free R: radius.
+free layer0: layer.
+free t0: timestamp.
+free g: public_param.
+free h: public_param.
+free one: bitstring.
+
+free xy_hit: bitstring [private].
+free z_hit: bitstring [private].
+free q_non_candidate: bitstring [private].
+free z_non_candidate: bitstring [private].
+free triple_non_candidate: bitstring [private].
+
+weaksecret q_non_candidate.
+weaksecret triple_non_candidate.
+noninterf q_non_candidate, triple_non_candidate.
+
+fun point(bitstring, bitstring): bitstring [data].
+fun triple(bitstring, bitstring, bitstring): bitstring [data].
+fun payload(bitstring, bitstring): bitstring [data].
+fun cell_id(bitstring, radius): cell.
+fun xyz_cell(bitstring, bitstring, radius): cell.
+equation forall xy: bitstring, z: bitstring, r: radius;
+    cell_id(point(xy, z), r) = xyz_cell(xy, z, r).
+fun block_id(cell, layer, timestamp): block.
+fun triple_block(bitstring, radius, layer, timestamp): block.
+
+fun okvs_encode(block, block, public_param): okvs.
+reduc forall b_hit: block, b_other: block, v: public_param;
+    okvs_decode(okvs_encode(b_hit, b_other, v), b_hit) = v.
+
+(* Ideal masked payload lookup represents E' and EC-ElGamal transport. *)
+fun payload_encode(block, bitstring, block, bitstring, public_param): payload_okvs.
+fun mask_payload(payload_okvs, block, bitstring, public_param): bitstring.
+reduc forall b_hit: block, b_other: block, p_hit: bitstring,
+             p_other: bitstring, v: public_param, m: bitstring,
+             pk: public_param;
+    unmask_payload(
+        mask_payload(payload_encode(b_hit, p_hit, b_other, p_other, v),
+                     b_hit, m, pk), m) = p_hit.
+
+fun rerand(public_param, public_param): public_param.
+fun ddh_value(public_param, public_param): bitstring [private].
+fun init_msg(public_param, public_param, okvs, public_param, payload_okvs):
+    bitstring [data].
+fun sender_item(token, public_param, bitstring): bitstring [data].
+fun final_result(bitstring): bitstring [data].
+
+fun mpc_server_input(token, bitstring, bitstring): bitstring [data].
+fun mpc_client_input(token, bitstring, bitstring, bitstring): bitstring [data].
+fun mpc_result(token, bitstring): bitstring [data].
+fun ideal_mpc_count(bitstring, bitstring): bitstring [private].
+
+event senderItemBuilt(token).
+event hiddenCoarseMatch(token).
+event mpcChecked(token).
+event mpcCount(token, bitstring).
+event resultAccepted(token, bitstring).
+
+query attacker(q_non_candidate).
+query attacker(point(q_non_candidate, z_non_candidate)).
+query attacker(triple_non_candidate).
+query cid: token;
+    event(hiddenCoarseMatch(cid)) ==> event(senderItemBuilt(cid)).
+query cid: token, n: bitstring;
+    event(resultAccepted(cid, n)) ==>
+    event(hiddenCoarseMatch(cid)) && event(mpcChecked(cid)) &&
+    event(mpcCount(cid, n)).
+
+let uavA() =
+    new beforeA: bitstring;
+    new afterA: bitstring;
+    new ppA: public_param;
+    new ppPayload: public_param;
+    new pkEl: public_param;
+    let posA = point(xy_hit, z_hit) in
+    let cellA = cell_id(posA, R) in
+    let blockA = block_id(cellA, layer0, t0) in
+    let otherBlockA = triple_block(triple_non_candidate, R, layer0, t0) in
+    let sTriple = triple(beforeA, posA, afterA) in
+    let E = okvs_encode(blockA, otherBlockA, ppA) in
+    let EPayload = payload_encode(blockA, payload(one, sTriple),
+                                  otherBlockA,
+                                  payload(one, triple_non_candidate),
+                                  ppPayload) in
+    out(c, init_msg(g, h, E, pkEl, EPayload));
+
+    ! (in(c, sender_item(cidA: token, uB: public_param,
+                         masked: bitstring));
+       let dhA = ddh_value(uB, ppA) in
+       out(c_mpc_server, mpc_server_input(cidA, dhA, masked))).
+
+let uavB() =
+    in(c, init_msg(gA: public_param, hA: public_param,
+                   EA: okvs, pkEl: public_param, EPayload: payload_okvs));
+    let posB = point(xy_hit, z_hit) in
+    let cellB = cell_id(posB, R) in
+    let blockB = block_id(cellB, layer0, t0) in
+    let decoded = okvs_decode(EA, blockB) in
+    new cidB: token;
+    new maskB: bitstring;
+    let uB = rerand(gA, decoded) in
+    let dhB = ddh_value(uB, decoded) in
+    let maskedB = mask_payload(EPayload, blockB, maskB, pkEl) in
+    event senderItemBuilt(cidB);
+
+    new cidMiss: token;
+    new ppMiss: public_param;
+    new tMiss: timestamp;
+    new maskMiss: bitstring;
+    let missPoint = point(q_non_candidate, z_non_candidate) in
+    let missBlock = block_id(cell_id(missPoint, R), layer0, tMiss) in
+    let uMiss = rerand(gA, ppMiss) in
+    let dhMiss = ddh_value(uMiss, ppMiss) in
+    let maskedMiss = mask_payload(EPayload, missBlock, maskMiss, pkEl) in
+    event senderItemBuilt(cidMiss);
+    out(c, sender_item(cidMiss, uMiss, maskedMiss));
+    out(c, sender_item(cidB, uB, maskedB));
+    (out(c_mpc_client,
+         mpc_client_input(cidMiss, dhMiss, maskMiss, missPoint))
+     |
+     (out(c_mpc_client, mpc_client_input(cidB, dhB, maskB, posB));
+      in(c_mpc_result, mpc_result(=cidB, n: bitstring));
+      event resultAccepted(cidB, n);
+      out(c, final_result(n)))).
+
+let idealMPC() =
+    in(c_mpc_server,
+       mpc_server_input(cid: token, dhA: bitstring, masked: bitstring));
+    in(c_mpc_client,
+       mpc_client_input(=cid, dhB: bitstring, maskB: bitstring,
+                        queryPoint: bitstring));
+    if dhA = dhB then
+        let payload(=one, sTriple: bitstring) =
+            unmask_payload(masked, maskB) in
+        event hiddenCoarseMatch(cid);
+        event mpcChecked(cid);
+        let n = ideal_mpc_count(sTriple, queryPoint) in
+        event mpcCount(cid, n);
+        out(c_mpc_result, mpc_result(cid, n)).
+
+process
+    uavA() | uavB() | (!idealMPC())
